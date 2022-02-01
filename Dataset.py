@@ -67,7 +67,6 @@ class Dataset:
         log: logistic calibration, aka Platt scaling -- Platt (1999)
         beta: beta calibration -- Kull et al. (2017)
         dirichlet: dirichlet calibration -- Kull et al. (2019)
-
         '''
 
         if how=="kumar" or how=="hb":
@@ -80,14 +79,16 @@ class Dataset:
             lr = LogisticRegression().fit(X, train['actual'])
             a, b = lr.coef_[0][0], lr.intercept_[0]
             new_probs = np.array(1/(1+1/(np.exp(a*test['prob_1'] + b)))).reshape(-1,1)
-            return np.hstack([new_probs, 1-new_probs])
+            return np.hstack([1-new_probs, new_probs])
         if how=="beta":
-            s1 = np.log(train['prob_1']); s2 = -1*np.log(1-train['prob_1'])
+            train_probs = train['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
+            s1 = np.log(train_probs); s2 = -1*np.log(1-train_probs)
             X = np.column_stack((s1, s2))
             lr = LogisticRegression().fit(X, train['actual'])
             a, b, c = lr.coef_[0][0], lr.coef_[0][1], lr.intercept_[0]
-            new_probs = np.array(1/(1+1/(np.exp(c) * np.power(test['prob_1'], a) / np.power((1-test['prob_1']),b)))).reshape(-1,1)
-            return np.hstack([new_probs, 1-new_probs])
+            test_probs = test['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
+            new_probs = np.array(1/(1+1/(np.exp(c) * np.power(test_probs, a) / np.power((1-test_probs),b)))).reshape(-1,1)
+            return np.hstack([1-new_probs, new_probs])
         if how=="dirichlet":
             calibrator = FullDirichletCalibrator(reg_lambda=[1e-3], reg_mu=None)
             skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=0)
@@ -113,7 +114,33 @@ class Dataset:
         self.df = pd.merge(self.df, tmp, left_index=True, right_index=True)
         self.df['pred_error'+label] = self.df.apply(lambda x: 1-np.max(x[col_names]), axis=1)
         self.df['err_diff'+label] = self.df['incorrect'].astype(int) - self.df['pred_error'+label]
+
+
+    def split_calibrate(self, var, splits, how='kumar'):
+        # split up dataset by given breakpoints
+        df_cals = [self.df_cal[self.df_cal[var]<splits[0]].copy()]
+        dfs = [self.df[self.df[var]<splits[0]].copy()]
+        for i in range(1, len(splits)):
+            df_cals.append(self.df_cal[np.logical_and(self.df_cal[var]>=splits[i-1], self.df_cal[var]<splits[i])].copy())
+            dfs.append(self.df[np.logical_and(self.df[var]>=splits[i-1], self.df[var]<splits[i])].copy())
+        df_cals.append(self.df_cal[self.df_cal[var]>=splits[-1]].copy())
+        dfs.append(self.df[self.df[var]>=splits[-1]].copy())
+        updated_dfs=[]
+
+        col_names = [n+"_split" for n in self.probs]
         
+        # perform calibration separately for each subset
+        for i in range(len(dfs)):
+            new_probs = self.get_calibrated_probs(df_cals[i].copy(), dfs[i].copy(), how=how)
+            df_tmp = pd.DataFrame(new_probs, columns=col_names, index=dfs[i].index)
+            updated_dfs.append(pd.merge(dfs[i], df_tmp, left_index=True, right_index=True))
+
+        # recombine
+        df = pd.concat(updated_dfs)
+        df['pred_error_split'] = df.apply(lambda x: 1-np.max(x[col_names]), axis=1)
+        df['err_diff_split'] = df['incorrect'].astype(int) - df['pred_error_split'] 
+        self.df = df.copy()
+
 
     def compute_VECE(self, var, label='', num_bins=10):
         '''
@@ -125,6 +152,7 @@ class Dataset:
         grouped = df.groupby('bin_var').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
         grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
         vece = sum(grouped['cont'])
+
         return vece
 
     
@@ -138,7 +166,25 @@ class Dataset:
         grouped = df.groupby('bin_score').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
         grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
         ece = sum(grouped['cont'])
+
         return ece
+
+    def max_diff(self, var, s=0.75, label=""):
+        '''
+        for a given variable, determine the maximum variable-wise difference between 
+        error and predicted error
+        '''
+        x_min, x_max = np.quantile(self.df[var], [0.05, 0.95])
+        xerr, yerr, _, _ = self.lowess_smooth(var, 'incorrect',x_min, x_max,s)
+        xperr, yperr, _, _ = self.lowess_smooth(var, 'pred_error'+label,x_min, x_max,s)
+        max_diff = 0
+
+        for i in range(len(xerr)):
+            diff = abs(yerr[i]-yperr[i])
+            if diff > max_diff:
+                max_diff = diff
+
+        return max_diff
 
 
     def var_wise_bins(self, metric):
