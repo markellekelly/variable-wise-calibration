@@ -6,169 +6,118 @@ from skmisc.loess import loess
 from sklearn.linear_model import LogisticRegression
 
 import calibration as cal
+from dirichletcal.calib.fulldirichlet import FullDirichletCalibrator
+import warnings
+from sklearn.model_selection import GridSearchCV,StratifiedKFold
+
+from utils import bootstrap_ci
 
 random_seed = 0
 np.random.seed(random_seed)
 
-def add_vars(df):
-    
-    df['pred_error'] = 1-np.maximum(df['prob_0'], df['prob_1'])
-    df['incorrect'] = df['actual'] != df['pred']
-    df['err_diff'] = df['incorrect'].astype(int) - df['pred_error']
-    
-    return df
-
-def bootstrap_ci(data, n=1000, func=np.mean, p=0.95):
-
-    sample_size = len(data)
-    simulations = [func(np.random.choice(data, size=sample_size, replace=True)) for i in range(n)]
-    simulations.sort()
-    u_pval = (1+p)/2.
-    l_pval = (1-u_pval)
-    l_indx = int(np.floor(n*l_pval))
-    u_indx = int(np.floor(n*u_pval))
-    
-    return(simulations[l_indx],simulations[u_indx])
-
-def calib(df, bins=15, how='kumar'):
-    '''
-    train calibrator 
-    '''
-    
-    probs = df[['prob_0','prob_1']]
-    if how=="kumar":
-        calibrator = cal.PlattBinnerMarginalCalibrator(len(df), num_bins=bins)
-    elif how=="hb":
-        calibrator = cal.HistogramMarginalCalibrator(len(df), num_bins=bins)
-    calibrator.train_calibration(probs, df['actual'])
-    
-    return calibrator
-
-def stepwise_vals(grouped):
-    edges=[grouped.iloc[0]['bin'].left]
-    for row in grouped.iterrows():
-        b = row[1]['bin']
-        edges.append(b.right)
-    heights = np.array(grouped['mean'])
-    return edges, heights
-
-
 class Dataset:
     
-    def __init__(self, df, cal_size=500, cal_bins=10, cal=True):
-        df = add_vars(df)
-        self.df_cal = df.sample(n=cal_size, replace=False, random_state=0)
-        self.df = df.drop(self.df_cal.index, axis=0).copy()
+    def __init__(self, df, k=2, bins=10, cal=True, cal_size=500):
+        
+        self.k = k
+        self.bins = bins
+        self.probs = ["prob_" + str(i) for i in range(0,self.k)]
+        df = self.process(df)
         if cal:
-            hb_cal = calib(self.df_cal, how='hb')
-            self.get_calibrated_probs(hb_cal, "_hb")
-            kumar_cal = calib(self.df_cal, how='kumar')
-            self.get_calibrated_probs(hb_cal, "_kumar")
-            self.add_calibrated_probs(self.logistic_calibrate(self.df_cal, self.df), "_log")
-            self.add_calibrated_probs(self.beta_calibrate(self.df_cal, self.df), "_beta")
+            self.split_cal_set(df, cal_size)
+            methods = ['kumar','hb','log','beta'] if k==2 else ['kumar','hb','dirichlet']
+            for m in methods:
+                self.calibrate("_"+m, how=m)
+        else:
+            self.df = df.copy()
 
-    def reliability_diagram(self, label="", hist_weight=0.0001):
 
-        df = self.df.copy()
-        df['confidence'+label] = 1-df['pred_error'+label]
-        df['correct'] = df['incorrect'].apply(lambda x: 0 if x==1 else 1)
-        b = [0.1*i for i in range(5,11)]
-        df['bin'] = pd.cut(df['confidence'+label], bins=b, duplicates='raise')
-        grouped = df.groupby('bin').aggregate({'confidence'+label:'mean','correct':'mean', 'prob_0':'count'})
-        y = grouped['correct']
-        s = grouped["confidence"+label]
-        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
-        x = [(b[i] +b[i+1])/2 for i in range(len(b)-1)]
-        data = df['confidence'+label]
-
-        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot([0.5, 1], [0.5, 1], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
-        ax1.plot(s, y,color='red',linewidth=2, label="Model")
-        ax1.scatter(s, y,color='red',marker="D",s=15)
-        ax1.bar(x, y, width=0.1, color='blue', alpha=0.25)
-
-        (counts, bins) = np.histogram(data, bins=30)
-
-        factor = 2
-        ax1.hist(bins[:-1], bins, weights=hist_weight*counts, color='black', label="Density")
-
-        ax1.set_ylabel("Accuracy", fontsize=16)
-        ax1.set_xlabel("Confidence", fontsize=16)
-        ax1.set_ylim([-0.05, 1.05])
-        ax1.legend(loc="upper left", prop={'size': 14})
-
-        ax1.tick_params(axis='both', which='major', labelsize=12)
-        ax1.tick_params(axis='both', which='minor', labelsize=12)
-
-        plt.show()
-
-        
-    def get_calibrated_probs(self, calibrator, label):
+    def process(self, df):
         '''
-        calibrate probabilities and add appropriate columns to the df
+        for plotting and calibration, add useful variables to the dataframe
+        incorrect: whether model's prediction was incorrect
+        pred_error: model's predicted error, equivalent to 1 - confidence
+        err_diff: difference between model's actual and predicted error
         '''
-        
-        probs = self.df[['prob_0','prob_1']]
-        calibrated_probs = calibrator.calibrate(probs)
 
-        cols = [i+label for i in ['prob_1','pred_error','err_diff']]
-        
-        self.df[cols[0]] = calibrated_probs.transpose()[1]
-        self.df[cols[1]] = 1-np.maximum(self.df[cols[0]], 1-self.df[cols[0]])
-        self.df[cols[2]] = self.df['incorrect'].astype(int) - self.df[cols[1]]
-
-    def compute_VECE(self, var, label='', num_bins=10):
-        df = self.df.copy()
-        n = len(df)
-        df['bin_var'] = pd.qcut(df[var], num_bins, duplicates='drop')
-        grouped = df.groupby('bin_var').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
-        grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
-        vece = sum(grouped['cont'])
-        return vece
+        df['incorrect'] = df['actual'] != df['pred']
+        df['pred_error'] = df.apply(lambda x: 1-np.max(x[self.probs]), axis=1)
+        df['err_diff'] = df['incorrect'].astype(int) - df['pred_error']
     
-    def compute_ECE(self, label='', num_bins=10):
-        df = self.df.copy()
-        n = len(df)
-        df['bin_score'] = pd.qcut(df['pred_error'], num_bins, duplicates='drop')
-        grouped = df.groupby('bin_score').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
-        grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
-        ece = sum(grouped['cont'])
-        return ece
+        return df
 
-    def add_calibrated_probs(self, probs, label):
+
+    def split_cal_set(self, df, cal_size):
         '''
-        given calibrated probabilities, add them and appropriate columns to the df
+        given a calibration set size, split the dataframe into calibration (df_cal)
+        and test (df) sets
         '''
-        cols = [i+label for i in ['prob_1','pred_error','err_diff']]
+        self.df_cal = df.sample(n=cal_size, replace=False, random_state=0).copy()
+        self.df = df.drop(self.df_cal.index, axis=0).copy()
+        self.df_cal.reset_index(drop=True, inplace=True)
+        self.df.reset_index(drop=True, inplace=True)
+
+
+    def get_calibrated_probs(self, train, test, how):
+        '''
+        given a train and test set and a calibration method, compute calibrated
+        probabilities. methods:
+        hb: standard histogram binning -- Zadrozny et al. (2001)
+        kumar: scaling-binning -- Kumar et al. (2019)
+        log: logistic calibration, aka Platt scaling -- Platt (1999)
+        beta: beta calibration -- Kull et al. (2017)
+        dirichlet: dirichlet calibration -- Kull et al. (2019)
+        '''
+
+        if how=="kumar" or how=="hb":
+            cc = cal.PlattBinnerMarginalCalibrator if how=="kumar" else cal.HistogramMarginalCalibrator
+            calibrator = cc(len(train), num_bins=self.bins)
+            calibrator.train_calibration(train[self.probs], train['actual'])
+            return calibrator.calibrate(test[self.probs])
+        if how=="log":
+            X = np.array(train['prob_1']).reshape(-1, 1)
+            lr = LogisticRegression().fit(X, train['actual'])
+            a, b = lr.coef_[0][0], lr.intercept_[0]
+            new_probs = np.array(1/(1+1/(np.exp(a*test['prob_1'] + b)))).reshape(-1,1)
+            return np.hstack([1-new_probs, new_probs])
+        if how=="beta":
+            train_probs = train['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
+            s1 = np.log(train_probs); s2 = -1*np.log(1-train_probs)
+            X = np.column_stack((s1, s2))
+            lr = LogisticRegression().fit(X, train['actual'])
+            a, b, c = lr.coef_[0][0], lr.coef_[0][1], lr.intercept_[0]
+            test_probs = test['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
+            new_probs = np.array(1/(1+1/(np.exp(c) * np.power(test_probs, a) / np.power((1-test_probs),b)))).reshape(-1,1)
+            return np.hstack([1-new_probs, new_probs])
+        if how=="dirichlet":
+            calibrator = FullDirichletCalibrator(reg_lambda=[1e-3], reg_mu=None)
+            skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=0)
+            gscv = GridSearchCV(calibrator, param_grid={'reg_lambda':  [1e-3], 'reg_mu': [None]},
+                cv=skf, scoring='neg_log_loss')
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                gscv.fit(np.array(train[self.probs]), np.array(train['actual']))
+            return gscv.predict_proba(np.array(test[self.probs]))
+
+       
+    def calibrate(self, label, how):
+        '''
+        for a given method (how), calibrate the entire test set using a calibrator
+        trained on the calibration set. then add appropriate columns to the dataframe.
+        '''
         
-        self.df[cols[0]] = list(probs)
-        self.df[cols[1]] = 1-np.maximum(self.df[cols[0]], 1-self.df[cols[0]])
-        self.df[cols[2]] = self.df['incorrect'].astype(int) - self.df[cols[1]]
+        calibrated_probs = self.get_calibrated_probs(self.df_cal, self.df, how)
 
-    def logistic_calibrate(self, cal, test):
-        y_train, s_train = cal['actual'], cal['prob_1']
-        s_test = test['prob_1']
-        X = np.array(s_train).reshape(-1, 1)
-        lr = LogisticRegression()
-        lr.fit(X, y_train)
-        a = lr.coef_[0][0]
-        c = lr.intercept_[0]
-        p_test = 1/(1+1/(np.exp(a*s_test + c)))
-        return p_test
-    
-    def beta_calibrate(self, cal, test):
-        y_train, s_train = cal['actual'], cal['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
-        s_test = test['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
-        s1 = np.log(s_train); s2 = -1*np.log(1-s_train)
-        X = np.column_stack((s1, s2))
-        lr = LogisticRegression()
-        lr.fit(X, y_train)
-        a, b = lr.coef_[0][0], lr.coef_[0][1]
-        d = lr.intercept_[0]
-        p_test = 1/(1+1/(np.exp(d) * np.power(s_test, a) / np.power((1-s_test),b)))
-        return p_test
+        col_names = [n+label for n in self.probs]
+        tmp = pd.DataFrame(calibrated_probs, columns=col_names)
+
+        self.df = pd.merge(self.df, tmp, left_index=True, right_index=True)
+        self.df['pred_error'+label] = self.df.apply(lambda x: 1-np.max(x[col_names]), axis=1)
+        self.df['err_diff'+label] = self.df['incorrect'].astype(int) - self.df['pred_error'+label]
+
 
     def split_calibrate(self, var, splits, how='kumar'):
+        # split up dataset by given breakpoints
         df_cals = [self.df_cal[self.df_cal[var]<splits[0]].copy()]
         dfs = [self.df[self.df[var]<splits[0]].copy()]
         for i in range(1, len(splits)):
@@ -176,51 +125,103 @@ class Dataset:
             dfs.append(self.df[np.logical_and(self.df[var]>=splits[i-1], self.df[var]<splits[i])].copy())
         df_cals.append(self.df_cal[self.df_cal[var]>=splits[-1]].copy())
         dfs.append(self.df[self.df[var]>=splits[-1]].copy())
-        
-        for i in range(len(dfs)):
-            if how=='kumar':
-                kumar1 = cal.PlattBinnerMarginalCalibrator(len(df_cals[i]), num_bins=10)
-                kumar1.train_calibration(df_cals[i][['prob_0','prob_1']], df_cals[i]['actual'])
-                dfs[i]['prob_1_split'] = kumar1.calibrate(dfs[i][['prob_0','prob_1']]).transpose()[1] 
-            elif how=='log':
-                dfs[i]['prob_1_split'] = self.logistic_calibrate(df_cals[i], dfs[i])
-            elif how=='beta':
-                dfs[i]['prob_1_split'] = self.beta_calibrate(df_cals[i], dfs[i])
+        updated_dfs=[]
 
-        df = pd.concat(dfs)
-        df['pred_error_split']=1-np.maximum(df['prob_1_split'], 1-df['prob_1_split'])
+        col_names = [n+"_split" for n in self.probs]
+        
+        # perform calibration separately for each subset
+        for i in range(len(dfs)):
+            new_probs = self.get_calibrated_probs(df_cals[i].copy(), dfs[i].copy(), how=how)
+            df_tmp = pd.DataFrame(new_probs, columns=col_names, index=dfs[i].index)
+            updated_dfs.append(pd.merge(dfs[i], df_tmp, left_index=True, right_index=True))
+
+        # recombine
+        df = pd.concat(updated_dfs)
+        df['pred_error_split'] = df.apply(lambda x: 1-np.max(x[col_names]), axis=1)
         df['err_diff_split'] = df['incorrect'].astype(int) - df['pred_error_split'] 
         self.df = df.copy()
 
-    def group(self, var):
-        grouped = self.df.groupby('bin').aggregate({var:['mean','std','count']})
+
+    def compute_VECE(self, var, label='', num_bins=10):
+        '''
+        compute the expected variable-wise calibration error for a given variable var
+        '''
+        df = self.df.copy()
+        n = len(df)
+        df['bin_var'] = pd.qcut(df[var], num_bins, duplicates='drop')
+        grouped = df.groupby('bin_var').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
+        grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
+        vece = sum(grouped['cont'])
+
+        return vece
+
+    
+    def compute_ECE(self, label='', num_bins=10):
+        '''
+        compute the standard expected calibration error
+        '''
+        df = self.df.copy()
+        n = len(df)
+        df['bin_score'] = pd.qcut(df['pred_error'], num_bins, duplicates='drop')
+        grouped = df.groupby('bin_score').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
+        grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
+        ece = sum(grouped['cont'])
+
+        return ece
+
+    def max_diff(self, var, s=0.75, label=""):
+        '''
+        for a given variable, determine the maximum variable-wise difference between 
+        error and predicted error
+        '''
+        x_min, x_max = np.quantile(self.df[var], [0.05, 0.95])
+        xerr, yerr, _, _ = self.lowess_smooth(var, 'incorrect',x_min, x_max,s)
+        xperr, yperr, _, _ = self.lowess_smooth(var, 'pred_error'+label,x_min, x_max,s)
+        max_diff = 0
+
+        for i in range(len(xerr)):
+            diff = abs(yerr[i]-yperr[i])
+            if diff > max_diff:
+                max_diff = diff
+
+        return max_diff
+
+
+    def var_wise_bins(self, metric):
+        '''
+        for a given metric (e.g. error rate), for each variable-wise bin, 
+        compute bootstrapped confidence intervals for plotting
+        '''
+        
+        grouped = self.df.groupby('bin').aggregate({metric:['mean','std','count']})
         grouped.columns = grouped.columns.get_level_values(1)
         grouped.reset_index(inplace=True)
-        return grouped
-        
-    def bins_for_var(self, var):
-        
-        grouped = self.group(var)
         edges, heights = stepwise_vals(grouped)
 
         heights_ll = []; heights_ul = []
         for row in grouped.iterrows():
-            data = self.df[self.df['bin']==row[1]['bin']][var]
+            data = self.df[self.df['bin']==row[1]['bin']][metric]
             l, u = bootstrap_ci(data)
             heights_ll.append(l); heights_ul.append(u)
         heights_ll.append(l); heights_ul.append(u)
         
         return edges, heights, heights_ll, heights_ul
 
-    def gen_binned_plots(self, var, bins=10, label="", title=None, return_coord=False, ax1c=None, ax2c=None):
+
+    def gen_plots_binned(self, var, bins=10, label="", title=None, return_coord=False, ax1c=None, ax2c=None):
+        '''
+        generate a suite of binned plots over a variable of interest var. useful for debugging
+        and investigation. includes error and predicted error vs. var, their difference vs. var,
+        and a histogram of the var
+        '''
 
         f, (ax1, ax2) = plt.subplots(2, 1, figsize=(9,11))
 
         # compute bins, means, and CIs for vars of interest
         self.df['bin'] = pd.qcut(self.df[var], bins, duplicates='drop')
-        edges_p, heights_p, heights_ll_p, heights_ul_p = self.bins_for_var('pred_error'+label)
-        edges_a, heights_a, heights_ll_a, heights_ul_a = self.bins_for_var('incorrect')
-        edges, heights, heights_ll, heights_ul = self.bins_for_var('err_diff'+label)
+        edges_p, heights_p, heights_ll_p, heights_ul_p = self.var_wise_bins('pred_error'+label)
+        edges_a, heights_a, heights_ll_a, heights_ul_a = self.var_wise_bins('incorrect')
+        edges, heights, heights_ll, heights_ul = self.var_wise_bins('err_diff'+label)
 
         # create the corresponding stair plots
         def stair_plot(ax, x, e, ll, ul, label, col):
@@ -235,8 +236,7 @@ class Dataset:
         if ax1c is None:
             ax1.set_ylim(m-0.02, ax1.get_ylim()[1])
         else:
-            ax1.set_ylim(ax1c)
-            ax2.set_ylim(ax2c)
+            ax1.set_ylim(ax1c); ax2.set_ylim(ax2c)
         
         ax2.axhspan(ymin=0, ymax=ax2.get_ylim()[1],color='green',alpha=0.05)
         ax2.axhspan(ymin=ax2.get_ylim()[0], ymax=0,color='red',alpha=0.05)
@@ -259,10 +259,6 @@ class Dataset:
         if return_coord:
             return ax1.get_ylim(), ax2.get_ylim()
 
-    def plot_comparison(self, var, labels, titles):
-        lim1, lim2 = self.gen_binned_plots(var, label=labels[0], title=titles[0], return_coord=True)
-        for l, t in zip(labels[1:], titles[1:]):
-            self.gen_binned_plots(var, label=l, title=t, ax1c=lim1, ax2c=lim2)
 
     def lowess_smooth(self, x, y, x_min, x_max, s=0.75):
         ''' 
@@ -281,52 +277,12 @@ class Dataset:
 
         return x_vals, y_new, ll, ul
 
-    def gen_plots_lowess(self, var, s=0.75, label=""):
-        ''' 
-        plot smoothed actual and predicted model error, and their difference.
-        again, only a tool for detecting regions of interest.
-        '''
-        xerr, yerr, ll, ul = self.lowess_smooth(var, 'incorrect',s)
-        xperr, yperr, pll, pul = self.lowess_smooth(var, 'pred_error'+label,s)
-        xdiff, diff, diffll, difful = self.lowess_smooth(var, 'err_diff'+label,s)
-        
-        f, (ax1, ax2) = plt.subplots(2, 1, figsize=(9,11))
-        ax1.plot(xerr,yerr, color='blue', label='Actual Error')
-        ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
-        ax1.plot(xperr,yperr, color='red', label='Predicted Error')
-        ax1.fill_between(xperr,pll,pul,color='red',alpha=0.3)
-        ax1.legend()
-        ax1.set_xlabel(var); ax1.set_ylabel('error')
-        
-        ax2.plot(xerr, diff, color='black')
-        ax2.fill_between(xerr,diffll,difful,color='black',alpha=0.3)
-        
-        ax2.axhspan(ymin=0, ymax=ax2.get_ylim()[1],color='green',alpha=0.05)
-        ax2.axhspan(ymin=ax2.get_ylim()[0], ymax=0,color='red',alpha=0.05)
-        
-        ax2.set_xlabel(var); ax2.set_ylabel('error')
-        
-        ax1.set_xlabel(var, fontsize=16); ax1.set_ylabel('% Error', fontsize=16)
-        ax2.set_xlabel(var, fontsize=16); ax2.set_ylabel('% Error', fontsize=16)
-        
-        plt.show()
-
-    def max_diff(self, var, s=0.75, label=""):
-        x_min, x_max = np.quantile(self.df[var], [0.05, 0.95])
-        xerr, yerr, _, _ = self.lowess_smooth(var, 'incorrect',x_min, x_max,s)
-        xperr, yperr, _, _ = self.lowess_smooth(var, 'pred_error'+label,x_min, x_max,s)
-        max_diff = 0
-        for i in range(len(xerr)):
-            diff = abs(yerr[i]-yperr[i])
-            if diff > max_diff:
-                max_diff = diff
-
-        return max_diff
 
     def gen_plot_lowess(self, var, s=0.75, label="", use_lim=False, ylim=None):
         ''' 
-        plot smoothed actual and predicted model error on a single, nicely-formatted plot.
-        option to set y limits from previous graphs to standardize
+        plot smoothed actual and predicted model error for a given variable var
+        can choose a smoothing factor s or a calibration method label
+        option to set y limits from previous graphs to standardize axes
         '''
 
         x_min, x_max = np.quantile(self.df[var], [0.05, 0.95])
@@ -338,11 +294,9 @@ class Dataset:
         ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
         ax1.plot(xperr,yperr, color='red', label='Predicted Error')
         ax1.fill_between(xperr,pll,pul,color='red',alpha=0.3)
-        ax1.legend(prop={'size': 14})
-        ax1.set_xlabel(var); ax1.set_ylabel('error')
-        
-        ax1.set_xlabel(var, fontsize=16); ax1.set_ylabel('% Error', fontsize=16)
 
+        ax1.legend(prop={'size': 14})
+        ax1.set_xlabel(var, fontsize=16); ax1.set_ylabel('% Error', fontsize=16)
         ax1.tick_params(axis='both', which='major', labelsize=12)
         ax1.tick_params(axis='both', which='minor', labelsize=12)
 
@@ -352,5 +306,47 @@ class Dataset:
             ax1.set_ylim(max(-1, ax1.get_ylim()[0]), ax1.get_ylim()[1])
         
         plt.show()
+
         if not use_lim:
             return ax1.get_ylim()
+
+
+    def reliability_diagram(self, label="", hist_weight=0.0001):
+        '''
+        for a given method label, generate a standard reliability diagram.
+        '''
+
+        df = self.df.copy()
+        df['confidence'+label] = 1-df['pred_error'+label]
+        df['correct'] = df['incorrect'].apply(lambda x: 0 if x==1 else 1)
+        b = [0.1*i for i in range(5,11)]
+        df['bin'] = pd.cut(df['confidence'+label], bins=b, duplicates='raise')
+        grouped = df.groupby('bin').aggregate({
+            'confidence'+label:'mean',
+            'correct':'mean',
+            'prob_0':'count'
+            })
+        y = grouped['correct']
+        s = grouped["confidence"+label]
+        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
+        x = [(b[i] +b[i+1])/2 for i in range(len(b)-1)]
+
+        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
+        ax1.plot([0.5, 1], [0.5, 1], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
+        ax1.plot(s, y, color='red',linewidth=2, label="Model")
+        ax1.scatter(s, y, color='red',marker="D",s=15)
+        ax1.bar(x, y, width=0.1, color='blue', alpha=0.25)
+
+        data = df['confidence'+label]
+        (counts, bins) = np.histogram(data, bins=30)
+        ax1.hist(bins[:-1], bins, weights=hist_weight*counts, color='black', label="Density")
+
+        ax1.set_ylabel("Accuracy", fontsize=16)
+        ax1.set_xlabel("Confidence", fontsize=16)
+        ax1.set_ylim([-0.05, 1.05])
+        ax1.legend(loc="upper left", prop={'size': 14})
+
+        ax1.tick_params(axis='both', which='major', labelsize=12)
+        ax1.tick_params(axis='both', which='minor', labelsize=12)
+
+        plt.show()
