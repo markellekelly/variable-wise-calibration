@@ -115,6 +115,32 @@ class Dataset:
         self.df['err_diff'+label] = self.df['incorrect'].astype(int) - self.df['pred_error'+label]
         
 
+    def compute_VECE(self, var, label='', num_bins=10):
+        '''
+        compute the expected variable-wise calibration error for a given variable var
+        '''
+        df = self.df.copy()
+        n = len(df)
+        df['bin_var'] = pd.qcut(df[var], num_bins, duplicates='drop')
+        grouped = df.groupby('bin_var').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
+        grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
+        vece = sum(grouped['cont'])
+        return vece
+
+    
+    def compute_ECE(self, label='', num_bins=10):
+        '''
+        compute the standard expected calibration error
+        '''
+        df = self.df.copy()
+        n = len(df)
+        df['bin_score'] = pd.qcut(df['pred_error'], num_bins, duplicates='drop')
+        grouped = df.groupby('bin_score').aggregate({'pred_error'+label:'mean','incorrect':'mean', 'prob_0':'count'})
+        grouped['cont'] = (grouped['prob_0']/n)*np.absolute(grouped['pred_error'+label]-grouped['incorrect'])
+        ece = sum(grouped['cont'])
+        return ece
+
+
     def var_wise_bins(self, metric):
         '''
         for a given metric (e.g. error rate), for each variable-wise bin, 
@@ -187,6 +213,7 @@ class Dataset:
         if return_coord:
             return ax1.get_ylim(), ax2.get_ylim()
 
+
     def lowess_smooth(self, x, y, x_min, x_max, s=0.75):
         ''' 
         perform lowess smoothing given x and y
@@ -203,6 +230,7 @@ class Dataset:
         ul = conf.upper
 
         return x_vals, y_new, ll, ul
+
 
     def gen_plot_lowess(self, var, s=0.75, label="", use_lim=False, ylim=None):
         ''' 
@@ -235,3 +263,44 @@ class Dataset:
 
         if not use_lim:
             return ax1.get_ylim()
+
+
+    def reliability_diagram(self, label="", hist_weight=0.0001):
+        '''
+        for a given method label, generate a standard reliability diagram.
+        '''
+
+        df = self.df.copy()
+        df['confidence'+label] = 1-df['pred_error'+label]
+        df['correct'] = df['incorrect'].apply(lambda x: 0 if x==1 else 1)
+        b = [0.1*i for i in range(5,11)]
+        df['bin'] = pd.cut(df['confidence'+label], bins=b, duplicates='raise')
+        grouped = df.groupby('bin').aggregate({
+            'confidence'+label:'mean',
+            'correct':'mean',
+            'prob_0':'count'
+            })
+        y = grouped['correct']
+        s = grouped["confidence"+label]
+        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
+        x = [(b[i] +b[i+1])/2 for i in range(len(b)-1)]
+
+        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
+        ax1.plot([0.5, 1], [0.5, 1], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
+        ax1.plot(s, y, color='red',linewidth=2, label="Model")
+        ax1.scatter(s, y, color='red',marker="D",s=15)
+        ax1.bar(x, y, width=0.1, color='blue', alpha=0.25)
+
+        data = df['confidence'+label]
+        (counts, bins) = np.histogram(data, bins=30)
+        ax1.hist(bins[:-1], bins, weights=hist_weight*counts, color='black', label="Density")
+
+        ax1.set_ylabel("Accuracy", fontsize=16)
+        ax1.set_xlabel("Confidence", fontsize=16)
+        ax1.set_ylim([-0.05, 1.05])
+        ax1.legend(loc="upper left", prop={'size': 14})
+
+        ax1.tick_params(axis='both', which='major', labelsize=12)
+        ax1.tick_params(axis='both', which='minor', labelsize=12)
+
+        plt.show()
