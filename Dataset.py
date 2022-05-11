@@ -278,7 +278,7 @@ class Dataset:
         return x_vals, y_new, ll, ul
 
 
-    def gen_plot_lowess(self, var, s=0.75, label="", use_lim=False, ylim=None):
+    def gen_plot_lowess(self, var, s=0.75, label="", use_lim=False, ylim=None, filename=None):
         ''' 
         plot smoothed actual and predicted model error for a given variable var
         can choose a smoothing factor s or a calibration method label
@@ -295,15 +295,18 @@ class Dataset:
         ax1.plot(xperr,yperr, color='red', label='Predicted Error')
         ax1.fill_between(xperr,pll,pul,color='red',alpha=0.3)
 
-        ax1.legend(prop={'size': 14})
-        ax1.set_xlabel(var, fontsize=16); ax1.set_ylabel('% Error', fontsize=16)
-        ax1.tick_params(axis='both', which='major', labelsize=12)
-        ax1.tick_params(axis='both', which='minor', labelsize=12)
+        ax1.legend(prop={'size': 18})
+        ax1.set_xlabel(var, fontsize=20); ax1.set_ylabel('% Error', fontsize=20)
+        ax1.tick_params(axis='both', which='major', labelsize=14)
+        ax1.tick_params(axis='both', which='minor', labelsize=14)
 
         if use_lim:
             ax1.set_ylim(ylim)
         else:
             ax1.set_ylim(max(-1, ax1.get_ylim()[0]), ax1.get_ylim()[1])
+            
+        if filename:
+            plt.savefig(filename,bbox_inches="tight")
         
         plt.show()
 
@@ -311,7 +314,7 @@ class Dataset:
             return ax1.get_ylim()
 
 
-    def reliability_diagram(self, label="", hist_weight=0.0001):
+    def reliability_diagram(self, label="", hist_weight=0.0001, filename=None):
         '''
         for a given method label, generate a standard reliability diagram.
         '''
@@ -341,12 +344,15 @@ class Dataset:
         (counts, bins) = np.histogram(data, bins=30)
         ax1.hist(bins[:-1], bins, weights=hist_weight*counts, color='black', label="Density")
 
-        ax1.set_ylabel("Accuracy", fontsize=16)
-        ax1.set_xlabel("Confidence", fontsize=16)
+        ax1.set_ylabel("Accuracy", fontsize=20)
+        ax1.set_xlabel("Confidence", fontsize=20)
         ax1.set_ylim([-0.05, 1.05])
-        ax1.legend(loc="upper left", prop={'size': 14})
+        ax1.legend(loc="upper left", prop={'size': 18})
 
-        ax1.tick_params(axis='both', which='major', labelsize=12)
-        ax1.tick_params(axis='both', which='minor', labelsize=12)
+        ax1.tick_params(axis='both', which='major', labelsize=14)
+        ax1.tick_params(axis='both', which='minor', labelsize=14)
+        
+        if filename:
+            plt.savefig(filename,bbox_inches="tight")
 
         plt.show()
