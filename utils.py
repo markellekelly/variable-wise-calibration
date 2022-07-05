@@ -51,7 +51,7 @@ def get_splits(X_train, X_test, y_train, y_test, max_depth=2, min_samples_leaf=1
     boxes = []
     for var in X_train.columns:
         sub_train = X_train[[var]]; sub_test = X_test[[var]]
-        clf = tree.DecisionTreeRegressor(max_depth=max_depth, min_samples_leaf=min_samples_leaf)
+        clf = tree.DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_samples_leaf)
         clf = clf.fit(sub_train, y_train)
         clf.score(sub_test, y_test)
         boxes.extend(get_lineage(clf, [var]))
