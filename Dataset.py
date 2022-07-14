@@ -278,7 +278,7 @@ class Dataset:
         return x_vals, y_new, ll, ul
 
 
-    def gen_plot_lowess(self, var, s=0.75, label="", use_lim=False, ylim=None, filename=None):
+    def gen_plot_lowess(self, var, s=0.75, label="", use_lim=False, ylim=None, filename=None, hist=None):
         ''' 
         plot smoothed actual and predicted model error for a given variable var
         can choose a smoothing factor s or a calibration method label
@@ -292,18 +292,34 @@ class Dataset:
         f, ax1 = plt.subplots(1, 1, figsize=(9,7))
         ax1.plot(xerr,yerr, color='blue', label='Actual Error')
         ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
-        ax1.plot(xperr,yperr, color='red', label='Predicted Error')
+        ax1.plot(xperr,yperr, color='red', label="Model's Predicted Error")
         ax1.fill_between(xperr,pll,pul,color='red',alpha=0.3)
-
-        ax1.legend(prop={'size': 18})
-        ax1.set_xlabel(var, fontsize=20); ax1.set_ylabel('% Error', fontsize=20)
-        ax1.tick_params(axis='both', which='major', labelsize=14)
-        ax1.tick_params(axis='both', which='minor', labelsize=14)
 
         if use_lim:
             ax1.set_ylim(ylim)
         else:
             ax1.set_ylim(max(-1, ax1.get_ylim()[0]), ax1.get_ylim()[1])
+            
+        if hist:
+            ax2 = ax1.twinx()
+            (counts, bins) = np.histogram(self.df[var], bins=15)
+            ax2.hist(bins[:-1], bins, weights=counts, color='black', label="P("+var+")")
+            ax2.set_ylim(-500, ax2.get_ylim()[1]*7)
+            ax2.tick_params(
+                axis='y',          # changes apply to the x-axis
+                which='both',      # both major and minor ticks are affected
+                right=False,      # ticks along the bottom edge are off
+                labelright=False)
+            lines, labels = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines + lines2, labels + labels2, prop={'size': 18}, loc="upper left")
+        
+        else:
+            ax1.legend(prop={'size': 18})
+            
+        ax1.set_xlabel(var, fontsize=20); ax1.set_ylabel('% Error', fontsize=20)
+        ax1.tick_params(axis='both', which='major', labelsize=14)
+        ax1.tick_params(axis='both', which='minor', labelsize=14)
             
         if filename:
             plt.savefig(filename,bbox_inches="tight")
@@ -312,8 +328,7 @@ class Dataset:
 
         if not use_lim:
             return ax1.get_ylim()
-
-
+        
     def reliability_diagram(self, label="", hist_weight=0.0001, filename=None):
         '''
         for a given method label, generate a standard reliability diagram.
@@ -349,6 +364,124 @@ class Dataset:
         ax1.set_ylim([-0.05, 1.05])
         ax1.legend(loc="upper left", prop={'size': 18})
 
+        ax1.tick_params(axis='both', which='major', labelsize=14)
+        ax1.tick_params(axis='both', which='minor', labelsize=14)
+        
+        if filename:
+            plt.savefig(filename,bbox_inches="tight")
+
+        plt.show()
+
+
+    def reliability_diagram_new(self, label="", filename=None):
+        '''
+        for a given method label, generate a standard reliability diagram.
+        '''
+
+        df = self.df.copy()
+        df['confidence'+label] = 1-df['pred_error'+label]
+        df['correct'] = df['incorrect'].apply(lambda x: 0 if x==1 else 1)
+        b = [0.1*i for i in range(5,11)]
+        df['bin'] = pd.cut(df['confidence'+label], bins=b, duplicates='raise')
+        grouped = df.groupby('bin').aggregate({
+            'confidence'+label:'mean',
+            'correct':'mean',
+            'prob_0':'count'
+            })
+        y = grouped['correct']
+        s = grouped["confidence"+label]
+        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
+        x = [((b[i] +b[i+1])/2)*100 for i in range(len(b)-1)]
+
+        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
+        ax1.plot([50, 100], [0, 50], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
+        ax1.plot(s*100, y*100-50, color='red',linewidth=2, label="Model")
+        ax1.scatter(s*100, y*100-50, color='red',marker="D",s=15)
+        ax1.bar(x, y*100-50, width=10, color='blue', alpha=0.25)
+
+        data = df['confidence'+label]*100
+        ax2 = ax1.twinx()
+        (counts, bins) = np.histogram(data, bins=15)
+        ax2.hist(bins[:-1], bins, weights=counts, color='black', label="P(Score)")
+        ax2.set_ylim(-500, ax2.get_ylim()[1]*7)
+        ax2.tick_params(
+                axis='y',          # changes apply to the x-axis
+                which='both',      # both major and minor ticks are affected
+                right=False,      # ticks along the bottom edge are off
+                labelright=False)
+
+
+        ax1.set_ylabel("% Accuracy", fontsize=20)
+        ax1.set_xlabel("% Confidence", fontsize=20)
+        ax1.set_ylim([-5, 55])
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines + lines2, labels + labels2, loc="upper left", prop={'size': 18})
+        
+        labs = ax1.get_yticks()
+        ax1.set_yticklabels([str(int(j)+50) for j in labs])
+        
+        ax1.tick_params(axis='both', which='major', labelsize=14)
+        ax1.tick_params(axis='both', which='minor', labelsize=14)
+        
+        if filename:
+            plt.savefig(filename,bbox_inches="tight")
+
+        plt.show()
+        
+    def smoothed_reliability_diagram(self, sm=0.75, label="", filename=None):
+        '''
+        for a given method label, generate a smoothed reliability diagram.
+        '''
+
+        self.df['pred_err_100'+label] = self.df['pred_error'+label]*100
+        #self.df['correct'] = self.df['incorrect'].apply(lambda x: 0 if x==1 else 1)
+        df = self.df.copy()
+        b = [10*i for i in range(0,6)]
+        df['bin'] = pd.cut(df['pred_err_100'+label], bins=b, duplicates='raise')
+        grouped = df.groupby('bin').aggregate({
+            'pred_err_100'+label:'mean',
+            'incorrect':'mean',
+            'prob_0':'count'
+            })
+        y = grouped['incorrect']
+        s = grouped["pred_err_100"+label]
+        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
+        x = [((b[i] +b[i+1])/2) for i in range(len(b)-1)]
+        
+        x_min, x_max = np.quantile(df['pred_err_100'+label], [0.05, 0.95])
+        xerr, yerr, ll, ul = self.lowess_smooth('pred_err_100'+label, 'incorrect',x_min, x_max,sm)
+        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
+        ax1.plot(xerr,yerr, color='blue', label='Actual Error')
+        ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
+
+        #f, ax1 = plt.subplots(1, 1, figsize=(9,7))
+        ax1.plot([0, 50], [0, 50], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
+        #ax1.scatter(s*100, y*100-50, color='red',marker="D",s=15)
+        #ax1.bar(x, y*100, width=10, color='blue', alpha=0.25)
+
+        data = df['pred_err_100'+label]
+        ax2 = ax1.twinx()
+        (counts, bins) = np.histogram(data, bins=15)
+        ax2.hist(bins[:-1], bins, weights=counts, color='black', label="P(Score)")
+        ax2.set_ylim(-1200, ax2.get_ylim()[1]*11)
+        ax2.tick_params(
+                axis='y',          # changes apply to the x-axis
+                which='both',      # both major and minor ticks are affected
+                right=False,      # ticks along the bottom edge are off
+                labelright=False)
+
+
+        ax1.set_ylabel("% Error", fontsize=20)
+        ax1.set_xlabel("% Predicted Error", fontsize=20)
+        ax1.set_ylim([-5, 55])
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines + lines2, labels + labels2, loc="upper left", prop={'size': 18})
+        
+        labs = ax1.get_yticks()
+        #ax1.set_yticklabels([str(int(j)+50) for j in labs])
+        
         ax1.tick_params(axis='both', which='major', labelsize=14)
         ax1.tick_params(axis='both', which='minor', labelsize=14)
         
