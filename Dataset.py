@@ -278,19 +278,23 @@ class Dataset:
         return x_vals, y_new, ll, ul
 
 
-    def gen_plot_lowess(self, var, s=0.75, label="", use_lim=False, ylim=None, filename=None, hist=None):
+    def gen_plot_lowess(self, var, s=0.75, d=-0.009, d2=-5, d3=0, label="", use_lim=False,
+                        ylim=None, filename=None, hist=None, bins=15, a=0.05, loc="upper left"):
         ''' 
         plot smoothed actual and predicted model error for a given variable var
         can choose a smoothing factor s or a calibration method label
         option to set y limits from previous graphs to standardize axes
+        if hist=True, adds a histogram to the bottom of the plot,
+        where y axis start locations can be chosen with parameters 
+        d (error) and d2 (density), and error end location with d3
         '''
 
-        x_min, x_max = np.quantile(self.df[var], [0.05, 0.95])
+        x_min, x_max = np.quantile(self.df[var], [a, 1-a])
         xerr, yerr, ll, ul = self.lowess_smooth(var, 'incorrect',x_min, x_max,s)
         xperr, yperr, pll, pul = self.lowess_smooth(var, 'pred_error'+label,x_min, x_max,s)
         
         f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot(xerr,yerr, color='blue', label='Actual Error')
+        ax1.plot(xerr,yerr, color='blue', label='Actual Empirical Error')
         ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
         ax1.plot(xperr,yperr, color='red', label="Model's Predicted Error")
         ax1.fill_between(xperr,pll,pul,color='red',alpha=0.3)
@@ -298,21 +302,28 @@ class Dataset:
         if use_lim:
             ax1.set_ylim(ylim)
         else:
-            ax1.set_ylim(max(-1, ax1.get_ylim()[0]), ax1.get_ylim()[1])
+            ax1.set_ylim(d2, ax1.get_ylim()[1]+d3)
             
+        xlim = ax1.get_xlim()
+        
         if hist:
             ax2 = ax1.twinx()
-            (counts, bins) = np.histogram(self.df[var], bins=15)
-            ax2.hist(bins[:-1], bins, weights=counts, color='black', label="P("+var+")")
-            ax2.set_ylim(-500, ax2.get_ylim()[1]*7)
-            ax2.tick_params(
-                axis='y',          # changes apply to the x-axis
-                which='both',      # both major and minor ticks are affected
-                right=False,      # ticks along the bottom edge are off
-                labelright=False)
+            (counts, bins) = np.histogram(self.df[var], bins=bins, density=True)
+            ax2.hist(bins[:-1], bins, weights=counts, color='black', alpha=0.4, label="P("+var+")")
+            ax2.set_ylim(d, ax2.get_ylim()[1]*8)
             lines, labels = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines + lines2, labels + labels2, prop={'size': 18}, loc="upper left")
+            ax1.legend(lines + lines2, labels + labels2, prop={'size': 16}, loc=loc)
+            ax2.tick_params(axis='y', which='both', right=False, labelright=False)
+            ax1.set_xlim(xlim); ax2.set_xlim(xlim)
+            
+            labs = ax1.get_yticks()
+            ax1.set_yticks(labs.tolist())
+            ax1.set_yticklabels([j if int(j)>=0 else "" for j in labs])
+            
+            #could add axis labels for density with:
+            # ax2.set_ylabel('Density', fontsize=20, rotation=90+180,labelpad=20)
+            # ax2.tick_params(axis='y', which='both', labelsize=14)
         
         else:
             ax1.legend(prop={'size': 18})
@@ -373,69 +384,13 @@ class Dataset:
         plt.show()
 
 
-    def reliability_diagram_new(self, label="", filename=None):
+    def smoothed_reliability_diagram(self, sm=0.75, label="", filename=None, a=0.05, bins=15):
         '''
-        for a given method label, generate a standard reliability diagram.
-        '''
-
-        df = self.df.copy()
-        df['confidence'+label] = 1-df['pred_error'+label]
-        df['correct'] = df['incorrect'].apply(lambda x: 0 if x==1 else 1)
-        b = [0.1*i for i in range(5,11)]
-        df['bin'] = pd.cut(df['confidence'+label], bins=b, duplicates='raise')
-        grouped = df.groupby('bin').aggregate({
-            'confidence'+label:'mean',
-            'correct':'mean',
-            'prob_0':'count'
-            })
-        y = grouped['correct']
-        s = grouped["confidence"+label]
-        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
-        x = [((b[i] +b[i+1])/2)*100 for i in range(len(b)-1)]
-
-        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot([50, 100], [0, 50], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
-        ax1.plot(s*100, y*100-50, color='red',linewidth=2, label="Model")
-        ax1.scatter(s*100, y*100-50, color='red',marker="D",s=15)
-        ax1.bar(x, y*100-50, width=10, color='blue', alpha=0.25)
-
-        data = df['confidence'+label]*100
-        ax2 = ax1.twinx()
-        (counts, bins) = np.histogram(data, bins=15)
-        ax2.hist(bins[:-1], bins, weights=counts, color='black', label="P(Score)")
-        ax2.set_ylim(-500, ax2.get_ylim()[1]*7)
-        ax2.tick_params(
-                axis='y',          # changes apply to the x-axis
-                which='both',      # both major and minor ticks are affected
-                right=False,      # ticks along the bottom edge are off
-                labelright=False)
-
-
-        ax1.set_ylabel("% Accuracy", fontsize=20)
-        ax1.set_xlabel("% Confidence", fontsize=20)
-        ax1.set_ylim([-5, 55])
-        lines, labels = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines + lines2, labels + labels2, loc="upper left", prop={'size': 18})
-        
-        labs = ax1.get_yticks()
-        ax1.set_yticklabels([str(int(j)+50) for j in labs])
-        
-        ax1.tick_params(axis='both', which='major', labelsize=14)
-        ax1.tick_params(axis='both', which='minor', labelsize=14)
-        
-        if filename:
-            plt.savefig(filename,bbox_inches="tight")
-
-        plt.show()
-        
-    def smoothed_reliability_diagram(self, sm=0.75, label="", filename=None):
-        '''
-        for a given method label, generate a smoothed reliability diagram.
+        for a given method label, generate a smoothed reliability diagram
+        (matches more closely with variable-wise calibration plots)
         '''
 
         self.df['pred_err_100'+label] = self.df['pred_error'+label]*100
-        #self.df['correct'] = self.df['incorrect'].apply(lambda x: 0 if x==1 else 1)
         df = self.df.copy()
         b = [10*i for i in range(0,6)]
         df['bin'] = pd.cut(df['pred_err_100'+label], bins=b, duplicates='raise')
@@ -449,38 +404,27 @@ class Dataset:
         widths=[b[i+1] -b[i] for i in range(len(b)-1)]
         x = [((b[i] +b[i+1])/2) for i in range(len(b)-1)]
         
-        x_min, x_max = np.quantile(df['pred_err_100'+label], [0.05, 0.95])
+        x_min, x_max = np.quantile(df['pred_err_100'+label], [a, 1-a])
         xerr, yerr, ll, ul = self.lowess_smooth('pred_err_100'+label, 'incorrect',x_min, x_max,sm)
         f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot(xerr,yerr, color='blue', label='Actual Error')
+        ax1.plot(xerr,yerr, color='blue', label='Actual Empirical Error')
         ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
 
-        #f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot([0, 50], [0, 50], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
-        #ax1.scatter(s*100, y*100-50, color='red',marker="D",s=15)
-        #ax1.bar(x, y*100, width=10, color='blue', alpha=0.25)
+        ax1.plot([0, 50], [0, 50], ":", label="Model's Predicted Error", color='red',linewidth=2.5)
 
         data = df['pred_err_100'+label]
         ax2 = ax1.twinx()
-        (counts, bins) = np.histogram(data, bins=15)
-        ax2.hist(bins[:-1], bins, weights=counts, color='black', label="P(Score)")
-        ax2.set_ylim(-1200, ax2.get_ylim()[1]*11)
-        ax2.tick_params(
-                axis='y',          # changes apply to the x-axis
-                which='both',      # both major and minor ticks are affected
-                right=False,      # ticks along the bottom edge are off
-                labelright=False)
-
+        (counts, bins) = np.histogram(data, bins=bins, density=True)
+        ax2.hist(bins[:-1], bins, weights=counts, color='black', alpha=0.4, label="P(Predicted Error)")
+        ax2.set_ylim(-0.004, ax2.get_ylim()[1]*6)
+        ax2.tick_params(axis='y', which='both', right=False, labelright=False)
 
         ax1.set_ylabel("% Error", fontsize=20)
         ax1.set_xlabel("% Predicted Error", fontsize=20)
         ax1.set_ylim([-5, 55])
         lines, labels = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines + lines2, labels + labels2, loc="upper left", prop={'size': 18})
-        
-        labs = ax1.get_yticks()
-        #ax1.set_yticklabels([str(int(j)+50) for j in labs])
+        ax1.legend(lines + lines2, labels + labels2, loc="upper left", prop={'size': 16})
         
         ax1.tick_params(axis='both', which='major', labelsize=14)
         ax1.tick_params(axis='both', which='minor', labelsize=14)
