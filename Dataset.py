@@ -45,6 +45,18 @@ class Dataset:
         df['err_diff'] = df['incorrect'].astype(int) - df['pred_error']
     
         return df
+    
+    def compute_accuracy(self, label=None):
+        '''
+        compute the accuracy of the model. optionally, include a calibration label
+        to compute accuracy after post-hoc recalibration
+        '''
+        
+        if label==None:
+            return len(self.df[self.df['actual'] == self.df['pred']])/len(self.df)
+        col_names = [n+label for n in self.probs]
+        self.df['pred'+label] = np.argmax(np.array(self.df[col_names]),axis=1)
+        return len(self.df[self.df['actual'] == self.df['pred'+label]])/len(self.df)
 
 
     def split_cal_set(self, df, cal_size):
@@ -58,7 +70,7 @@ class Dataset:
         self.df.reset_index(drop=True, inplace=True)
 
 
-    def get_calibrated_probs(self, train, test, how):
+    def get_calibrated_probs(self, train, test, how, var):
         '''
         given a train and test set and a calibration method, compute calibrated
         probabilities. methods:
@@ -100,13 +112,13 @@ class Dataset:
             return gscv.predict_proba(np.array(test[self.probs]))
 
        
-    def calibrate(self, label, how):
+    def calibrate(self, label, how, var=None):
         '''
         for a given method (how), calibrate the entire test set using a calibrator
         trained on the calibration set. then add appropriate columns to the dataframe.
         '''
         
-        calibrated_probs = self.get_calibrated_probs(self.df_cal, self.df, how)
+        calibrated_probs = self.get_calibrated_probs(self.df_cal, self.df, how, var)
 
         col_names = [n+label for n in self.probs]
         tmp = pd.DataFrame(calibrated_probs, columns=col_names)
@@ -117,6 +129,12 @@ class Dataset:
 
 
     def split_calibrate(self, var, splits, how='kumar'):
+        '''
+        perform variable-based tree-based recalibration, given var, a variable to split
+        on, splits, breakpoints in the data learned via a decision tree, and how, the
+        type of recalibration to apply to each split
+        '''
+        
         # split up dataset by given breakpoints
         df_cals = [self.df_cal[self.df_cal[var]<splits[0]].copy()]
         dfs = [self.df[self.df[var]<splits[0]].copy()]
@@ -131,7 +149,7 @@ class Dataset:
         
         # perform calibration separately for each subset
         for i in range(len(dfs)):
-            new_probs = self.get_calibrated_probs(df_cals[i].copy(), dfs[i].copy(), how=how)
+            new_probs = self.get_calibrated_probs(df_cals[i].copy(), dfs[i].copy(), how=how, var=None)
             df_tmp = pd.DataFrame(new_probs, columns=col_names, index=dfs[i].index)
             updated_dfs.append(pd.merge(dfs[i], df_tmp, left_index=True, right_index=True))
 
@@ -140,11 +158,54 @@ class Dataset:
         df['pred_error_split'] = df.apply(lambda x: 1-np.max(x[col_names]), axis=1)
         df['err_diff_split'] = df['incorrect'].astype(int) - df['pred_error_split'] 
         self.df = df.copy()
+        
+        
+    def augmented_z_calibrate(self, var, label, degree=1, how='beta'):
+        '''
+        perform variable-wise augmented-beta (or augmented-logistic) calibration for a particular
+        variable var
+        degree parameter changes the degree of the corresponding logistic regression wrt var
+        how='logistic' performs augmented-logistic instead of augmented-beta
+        '''
+        train_probs = self.df_cal['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
+        test_probs = self.df['prob_1'].apply(lambda x: x+0.0001 if x==0 else (x-0.0001 if x==1 else x))
+        if how=='beta':
+            s1 = np.log(train_probs); s2 = -1*np.log(1-train_probs)
+            cols = [s1, s2]
+        elif how=='logistic':
+            cols = [train_probs]
+        for i in range(1,degree+1):
+            cols.append(self.df_cal[var]**i)
+        X = np.column_stack(tuple(cols))
+        
+        lr = LogisticRegression().fit(X, self.df_cal['actual'])
+        if how=='beta':
+            a, b, c, = lr.coef_[0][0], lr.coef_[0][1], lr.intercept_[0]
+            prob_term = np.power(test_probs, a)/np.power((1-test_probs),b)
+            extra=1
+        elif how=='logistic':
+            a, c = lr.coef_[0][0], lr.intercept_[0]
+            prob_term = np.exp(test_probs*a)
+            extra=0
+        var_term = np.exp(c)
+        for i in range(1,degree+1):
+            var_term *= np.exp(lr.coef_[0][i+extra]*(self.df[var]**i))
+        
+        new_probs = np.array(1/(1+1/(var_term * prob_term))).reshape(-1,1)
+        calibrated_probs = np.hstack([1-new_probs, new_probs])
+    
+        col_names = [n+label for n in self.probs]
+        tmp = pd.DataFrame(calibrated_probs, columns=col_names)
+
+        self.df = pd.merge(self.df, tmp, left_index=True, right_index=True)
+        self.df['pred_error'+label] = self.df.apply(lambda x: 1-np.max(x[col_names]), axis=1)
+        self.df['err_diff'+label] = self.df['incorrect'].astype(int) - self.df['pred_error'+label]
+        
 
 
     def compute_VECE(self, var, label='', num_bins=10):
         '''
-        compute the expected variable-wise calibration error for a given variable var
+        compute the expected variable-based calibration error for a given variable var
         '''
         df = self.df.copy()
         n = len(df)
@@ -171,7 +232,7 @@ class Dataset:
 
     def max_diff(self, var, s=0.75, label=""):
         '''
-        for a given variable, determine the maximum variable-wise difference between 
+        for a given variable, determine the maximum variable-based difference between 
         error and predicted error
         '''
         x_min, x_max = np.quantile(self.df[var], [0.05, 0.95])
@@ -189,7 +250,7 @@ class Dataset:
 
     def var_wise_bins(self, metric):
         '''
-        for a given metric (e.g. error rate), for each variable-wise bin, 
+        for a given metric (e.g. error rate), for each variable bin, 
         compute bootstrapped confidence intervals for plotting
         '''
         
@@ -310,6 +371,7 @@ class Dataset:
             ax2 = ax1.twinx()
             (counts, bins) = np.histogram(self.df[var], bins=bins, density=True)
             ax2.hist(bins[:-1], bins, weights=counts, color='black', alpha=0.4, label="P("+var+")")
+            #ax2.hist(bins[:-1], bins, weights=counts, color='black', label="Density")
             ax2.set_ylim(d, ax2.get_ylim()[1]*8)
             lines, labels = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
