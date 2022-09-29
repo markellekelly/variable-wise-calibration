@@ -1,5 +1,5 @@
 # variable-wise-calibration
-Code and examples for "Understanding Systematic Miscalibration in Machine Learning Classifiers"
+Code and examples for "Variable-Based Calibration for Machine Learning Classifiers"
 
 - Code for visualization and recalibration can be found in `Dataset.py` 
 - Data files used are in the `data` folder
