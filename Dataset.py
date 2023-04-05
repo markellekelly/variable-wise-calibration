@@ -4,16 +4,17 @@ import numpy as np
 
 from skmisc.loess import loess
 from sklearn.linear_model import LogisticRegression
+from sklearn import tree
 
 import calibration as cal
 from dirichletcal.calib.fulldirichlet import FullDirichletCalibrator
 import warnings
 from sklearn.model_selection import GridSearchCV,StratifiedKFold
 
-from utils import bootstrap_ci
 
 random_seed = 0
 np.random.seed(random_seed)
+plt.rcParams["font.family"] = "Times New Roman"
 
 class Dataset:
     
@@ -68,6 +69,66 @@ class Dataset:
         self.df = df.drop(self.df_cal.index, axis=0).copy()
         self.df_cal.reset_index(drop=True, inplace=True)
         self.df.reset_index(drop=True, inplace=True)
+        
+    def get_lineage(self, tree, feature_names):
+        '''
+        Parse a sklearn tree and return the rules corresponding to the leaf nodes
+        '''
+        if tree.tree_.node_count == 1:
+            return []
+        left = tree.tree_.children_left
+        right     = tree.tree_.children_right
+        threshold = tree.tree_.threshold
+        features  = [feature_names[i] if i != -2 else -2 for i in tree.tree_.feature]
+
+        idx = np.argwhere(left == -1)[:,0]     
+
+        def recurse(left, right, child, lineage=None):          
+            if lineage is None:
+                lineage = [child]
+            if child in left:
+                parent = np.where(left == child)[0].item()
+                split = 'l'
+            else:
+                parent = np.where(right == child)[0].item()
+                split = 'r'
+
+            lineage.append((split, threshold[parent], features[parent]))
+
+            if parent == 0:
+                lineage.reverse()
+                return lineage
+            else:
+                return recurse(left, right, parent, lineage)
+            
+        boxes = []
+        new_box = []
+        for child in idx:
+            for node in recurse(left, right, child):
+                if type(node) == np.int64:
+                    boxes.append(new_box)
+                    new_box = []
+                else:
+                    new_box.append(node)
+        return boxes
+
+
+    def get_splits(self, var, max_depth=2, min_samples_leaf=10):
+        '''
+        Given a train and test set, generate decision trees for each variable
+            and return the boxes corresponding to the leaf nodes
+        '''
+        boxes = []
+        for var in self.df_cal[[var]].columns:
+            sub_train = self.df_cal[[var]]; sub_test = self.df[[var]]
+            clf = tree.DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_samples_leaf)
+            clf = clf.fit(sub_train, self.df_cal['actual'])
+            clf.score(sub_test, self.df['actual'])
+            boxes.extend(self.get_lineage(clf, [var]))
+
+        s = set(np.array([item for sublist in boxes for item in sublist]).flatten())
+        s.remove('l'); s.remove('r'); s.remove(var)
+        return sorted([float(i) for i in s])
 
 
     def get_calibrated_probs(self, train, test, how, var):
@@ -128,7 +189,7 @@ class Dataset:
         self.df['err_diff'+label] = self.df['incorrect'].astype(int) - self.df['pred_error'+label]
 
 
-    def split_calibrate(self, var, splits, how='kumar'):
+    def split_calibrate(self, var, splits, how='beta'):
         '''
         perform variable-based tree-based recalibration, given var, a variable to split
         on, splits, breakpoints in the data learned via a decision tree, and how, the
@@ -247,80 +308,6 @@ class Dataset:
 
         return max_diff
 
-
-    def var_wise_bins(self, metric):
-        '''
-        for a given metric (e.g. error rate), for each variable bin, 
-        compute bootstrapped confidence intervals for plotting
-        '''
-        
-        grouped = self.df.groupby('bin').aggregate({metric:['mean','std','count']})
-        grouped.columns = grouped.columns.get_level_values(1)
-        grouped.reset_index(inplace=True)
-        edges, heights = stepwise_vals(grouped)
-
-        heights_ll = []; heights_ul = []
-        for row in grouped.iterrows():
-            data = self.df[self.df['bin']==row[1]['bin']][metric]
-            l, u = bootstrap_ci(data)
-            heights_ll.append(l); heights_ul.append(u)
-        heights_ll.append(l); heights_ul.append(u)
-        
-        return edges, heights, heights_ll, heights_ul
-
-
-    def gen_plots_binned(self, var, bins=10, label="", title=None, return_coord=False, ax1c=None, ax2c=None):
-        '''
-        generate a suite of binned plots over a variable of interest var. useful for debugging
-        and investigation. includes error and predicted error vs. var, their difference vs. var,
-        and a histogram of the var
-        '''
-
-        f, (ax1, ax2) = plt.subplots(2, 1, figsize=(9,11))
-
-        # compute bins, means, and CIs for vars of interest
-        self.df['bin'] = pd.qcut(self.df[var], bins, duplicates='drop')
-        edges_p, heights_p, heights_ll_p, heights_ul_p = self.var_wise_bins('pred_error'+label)
-        edges_a, heights_a, heights_ll_a, heights_ul_a = self.var_wise_bins('incorrect')
-        edges, heights, heights_ll, heights_ul = self.var_wise_bins('err_diff'+label)
-
-        # create the corresponding stair plots
-        def stair_plot(ax, x, e, ll, ul, label, col):
-            ax.stairs(x, edges=e, baseline=None, color=col, label=label)
-            ax.fill_between(e, ll, ul, step="post", alpha=0.3, color=col)
-        
-        m = min(min(heights_ll_p), min(heights_ll_a))
-        stair_plot(ax1, heights_p, edges_p, heights_ll_p, heights_ul_p, 'Predicted Error Rate', 'red')
-        stair_plot(ax1, heights_a, edges_a, heights_ll_a, heights_ul_a, 'Actual Error Rate', 'blue')
-        stair_plot(ax2, heights, edges, heights_ll, heights_ul, None, 'black')
-
-        if ax1c is None:
-            ax1.set_ylim(m-0.02, ax1.get_ylim()[1])
-        else:
-            ax1.set_ylim(ax1c); ax2.set_ylim(ax2c)
-        
-        ax2.axhspan(ymin=0, ymax=ax2.get_ylim()[1],color='green',alpha=0.05)
-        ax2.axhspan(ymin=ax2.get_ylim()[0], ymax=0,color='red',alpha=0.05)
-        ax2.axhline(y=np.mean(heights),color='orange',label='mean EE')
-        
-        # add axis titles and legends
-        ax1.set_xlabel(var, fontsize=16); ax1.set_ylabel("% Error", fontsize=16)
-        ax2.set_xlabel(var, fontsize=16); ax2.set_ylabel("% Error", fontsize=16)
-        ax1.legend(loc='lower right'); #ax2.legend()
-        if title:
-            ax1.set_title(title, fontsize=22)
-        plt.show()
-        
-        # add kernel density estimate of var
-        plt.figure(figsize=(9,2))
-        self.df[var].plot.kde(bw_method=0.3, color='black')
-        plt.xlim(ax2.get_xlim())
-        plt.show()
-
-        if return_coord:
-            return ax1.get_ylim(), ax2.get_ylim()
-
-
     def lowess_smooth(self, x, y, x_min, x_max, s=0.75):
         ''' 
         perform lowess smoothing given x and y
@@ -337,10 +324,9 @@ class Dataset:
         ul = conf.upper
 
         return x_vals, y_new, ll, ul
-
-
-    def gen_plot_lowess(self, var, s=0.75, d=-0.009, d2=-5, d3=0, label="", use_lim=False,
-                        ylim=None, filename=None, hist=None, bins=15, a=0.05, loc="upper left"):
+    
+    def gen_plot_lowess(self, var, s=0.75, d=-0.009, d2=-5, d3=0, label="", 
+                        filename=None, hist=None, bins=15, a=0.05, loc="upper left"):
         ''' 
         plot smoothed actual and predicted model error for a given variable var
         can choose a smoothing factor s or a calibration method label
@@ -355,143 +341,152 @@ class Dataset:
         xperr, yperr, pll, pul = self.lowess_smooth(var, 'pred_error'+label,x_min, x_max,s)
         
         f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot(xerr,yerr, color='blue', label='Actual Empirical Error')
+        ax1.plot(xerr,yerr, color='blue', label='Actual Error')
         ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
-        ax1.plot(xperr,yperr, color='red', label="Model's Predicted Error")
+        ax1.plot(xperr,yperr, color='red', label="Predicted Error")
         ax1.fill_between(xperr,pll,pul,color='red',alpha=0.3)
 
-        if use_lim:
-            ax1.set_ylim(ylim)
-        else:
-            ax1.set_ylim(d2, ax1.get_ylim()[1]+d3)
+        ax1.set_ylim(d2, ax1.get_ylim()[1]+d3)
             
         xlim = ax1.get_xlim()
         
         if hist:
             ax2 = ax1.twinx()
             (counts, bins) = np.histogram(self.df[var], bins=bins, density=True)
-            ax2.hist(bins[:-1], bins, weights=counts, color='black', alpha=0.4, label="P("+var+")")
-            #ax2.hist(bins[:-1], bins, weights=counts, color='black', label="Density")
+            ax2.hist(bins[:-1], bins, weights=counts, color='black', alpha=0.4, label="P("+var.split(' ')[0]+")")
             ax2.set_ylim(d, ax2.get_ylim()[1]*8)
             lines, labels = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines + lines2, labels + labels2, prop={'size': 16}, loc=loc)
+            
+            ax1.legend(lines + lines2, labels + labels2, prop={'size': 24}, loc=loc)
             ax2.tick_params(axis='y', which='both', right=False, labelright=False)
             ax1.set_xlim(xlim); ax2.set_xlim(xlim)
             
             labs = ax1.get_yticks()
             ax1.set_yticks(labs.tolist())
-            ax1.set_yticklabels([j if int(j)>=0 else "" for j in labs])
+            ax1.set_yticklabels([int(j) if int(j)>=0 else "" for j in labs])
             
-            #could add axis labels for density with:
-            # ax2.set_ylabel('Density', fontsize=20, rotation=90+180,labelpad=20)
-            # ax2.tick_params(axis='y', which='both', labelsize=14)
-        
-        else:
-            ax1.legend(prop={'size': 18})
-            
-        ax1.set_xlabel(var, fontsize=20); ax1.set_ylabel('% Error', fontsize=20)
-        ax1.tick_params(axis='both', which='major', labelsize=14)
-        ax1.tick_params(axis='both', which='minor', labelsize=14)
+        ax1.set_xlabel(var, fontsize=28); ax1.set_ylabel('% Error', fontsize=28)
+        ax1.tick_params(axis='both', which='major', labelsize=24)
+        ax1.tick_params(axis='both', which='minor', labelsize=24)
             
         if filename:
             plt.savefig(filename,bbox_inches="tight")
         
         plt.show()
 
-        if not use_lim:
-            return ax1.get_ylim()
         
-    def reliability_diagram(self, label="", hist_weight=0.0001, filename=None):
+    def plot_compare(self, var, label1="", label2="_beta", label3="_split",
+                     title1="Uncalibrated", title2="Beta calibration", title3="Variable-based calibration",
+                     s=0.9, d=-0.009, d2=-5, d3=0,
+                     filename=None, bins=15, a=0.05):
+        ''' 
+        generate 3 variable-based calibration plots for var with label1, label2, label3
+        y axis start locations can be chosen with parameters 
+        d (error) and d2 (density), and error end location with d3
         '''
-        for a given method label, generate a standard reliability diagram.
-        '''
 
-        df = self.df.copy()
-        df['confidence'+label] = 1-df['pred_error'+label]
-        df['correct'] = df['incorrect'].apply(lambda x: 0 if x==1 else 1)
-        b = [0.1*i for i in range(5,11)]
-        df['bin'] = pd.cut(df['confidence'+label], bins=b, duplicates='raise')
-        grouped = df.groupby('bin').aggregate({
-            'confidence'+label:'mean',
-            'correct':'mean',
-            'prob_0':'count'
-            })
-        y = grouped['correct']
-        s = grouped["confidence"+label]
-        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
-        x = [(b[i] +b[i+1])/2 for i in range(len(b)-1)]
-
-        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot([0.5, 1], [0.5, 1], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
-        ax1.plot(s, y, color='red',linewidth=2, label="Model")
-        ax1.scatter(s, y, color='red',marker="D",s=15)
-        ax1.bar(x, y, width=0.1, color='blue', alpha=0.25)
-
-        data = df['confidence'+label]
-        (counts, bins) = np.histogram(data, bins=30)
-        ax1.hist(bins[:-1], bins, weights=hist_weight*counts, color='black', label="Density")
-
-        ax1.set_ylabel("Accuracy", fontsize=20)
-        ax1.set_xlabel("Confidence", fontsize=20)
-        ax1.set_ylim([-0.05, 1.05])
-        ax1.legend(loc="upper left", prop={'size': 18})
-
-        ax1.tick_params(axis='both', which='major', labelsize=14)
-        ax1.tick_params(axis='both', which='minor', labelsize=14)
+        x_min, x_max = np.quantile(self.df[var], [a, 1-a])
+        xerr, yerr, ll, ul = self.lowess_smooth(var, 'incorrect',x_min, x_max,s)
+        counts, bins = np.histogram(self.df[var], bins=bins, density=True)
         
-        if filename:
-            plt.savefig(filename,bbox_inches="tight")
-
-        plt.show()
-
-
-    def smoothed_reliability_diagram(self, sm=0.75, label="", filename=None, a=0.05, bins=15):
-        '''
-        for a given method label, generate a smoothed reliability diagram
-        (matches more closely with variable-wise calibration plots)
-        '''
-
-        self.df['pred_err_100'+label] = self.df['pred_error'+label]*100
-        df = self.df.copy()
-        b = [10*i for i in range(0,6)]
-        df['bin'] = pd.cut(df['pred_err_100'+label], bins=b, duplicates='raise')
-        grouped = df.groupby('bin').aggregate({
-            'pred_err_100'+label:'mean',
-            'incorrect':'mean',
-            'prob_0':'count'
-            })
-        y = grouped['incorrect']
-        s = grouped["pred_err_100"+label]
-        widths=[b[i+1] -b[i] for i in range(len(b)-1)]
-        x = [((b[i] +b[i+1])/2) for i in range(len(b)-1)]
+        f, axes = plt.subplots(1, 3, figsize=(11*3,7))
         
-        x_min, x_max = np.quantile(df['pred_err_100'+label], [a, 1-a])
-        xerr, yerr, ll, ul = self.lowess_smooth('pred_err_100'+label, 'incorrect',x_min, x_max,sm)
-        f, ax1 = plt.subplots(1, 1, figsize=(9,7))
-        ax1.plot(xerr,yerr, color='blue', label='Actual Empirical Error')
-        ax1.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
+        for lab, ax, title, let in zip((label1, label2, label3), axes, (title1, title2, title3),('a','b','c')):
+            xperr, yperr, pll, pul = self.lowess_smooth(var, 'pred_error'+lab,x_min, x_max,s)
+            ax.plot(xerr,yerr, color='blue', label='Actual Empirical Error')
+            ax.fill_between(xerr,ll,ul,color='blue',alpha=0.3)
+            ax.plot(xperr,yperr, color='red', label="Model's Predicted Error")
+            ax.fill_between(xperr,pll,pul,color='red',alpha=0.3)
+            
+            xlim = ax.get_xlim()
+            ax2 = ax.twinx()
+            ax2.hist(bins[:-1], bins, weights=counts, color='black', alpha=0.4, label="P("+var+")")
+            ax2.set_ylim(d, ax2.get_ylim()[1]*8)
+            ax2.tick_params(axis='y', which='both', right=False, labelright=False)
+            
+            ax.set_xlabel(var, fontsize=36)
+            ax.tick_params(axis='both', which='major', labelsize=32)
+            ax.tick_params(axis='both', which='minor', labelsize=32)
+            ax.set_xlim(xlim); ax2.set_xlim(xlim)
+            ax.set_title("("+let+") "+title, fontsize=40, pad=15)
 
-        ax1.plot([0, 50], [0, 50], ":", label="Model's Predicted Error", color='red',linewidth=2.5)
-
-        data = df['pred_err_100'+label]
-        ax2 = ax1.twinx()
-        (counts, bins) = np.histogram(data, bins=bins, density=True)
-        ax2.hist(bins[:-1], bins, weights=counts, color='black', alpha=0.4, label="P(Predicted Error)")
-        ax2.set_ylim(-0.004, ax2.get_ylim()[1]*6)
-        ax2.tick_params(axis='y', which='both', right=False, labelright=False)
-
-        ax1.set_ylabel("% Error", fontsize=20)
-        ax1.set_xlabel("% Predicted Error", fontsize=20)
-        ax1.set_ylim([-5, 55])
-        lines, labels = ax1.get_legend_handles_labels()
+        ylim = (d2, axes[0].get_ylim()[1]+d3)
+        axes[0].set_ylim(ylim)
+        
+        labs = axes[0].get_yticks()
+        axes[0].set_yticks(labs.tolist())
+        axes[0].set_yticklabels([int(j) if int(j)>=0 else "" for j in labs])
+        axes[1].tick_params(labelleft=False); axes[2].tick_params(labelleft=False)
+        
+        for ax in axes:
+            ax.set_ylim(ylim)
+        
+        lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines + lines2, labels + labels2, loc="upper left", prop={'size': 16})
-        
-        ax1.tick_params(axis='both', which='major', labelsize=14)
-        ax1.tick_params(axis='both', which='minor', labelsize=14)
-        
+        f.legend(lines + lines2, labels + labels2, prop={'size': 36}, loc='upper center', bbox_to_anchor=(0.5, -0.05),
+          fancybox=True, ncol=3)
+            
+        axes[0].set_ylabel('% Error', fontsize=36)
+        #f.tight_layout()
+            
         if filename:
             plt.savefig(filename,bbox_inches="tight")
+        
+        plt.show()
+        
+    def rd_compare(self, label1="", label2="_beta", label3="_split",
+                     title1="Uncalibrated", title2="Beta calibration", title3="Variable-based calibration",
+                     hist_weight=0.00005, filename=None):
+        ''' 
+        generate 3 reliability diagrams with calibration methods label1, label2, label3
+        hist_weight resizes the histogram
+        '''
+        def get_info(label, b=[0.1*i for i in range(5,11)]):
+            df = self.df.copy()
+            df['confidence'+label] = 1-df['pred_error'+label]
+            df['correct'] = df['incorrect'].apply(lambda x: 0 if x==1 else 1)
+            df['bin'] = pd.cut(df['confidence'+label], bins=b, duplicates='raise')
+            grouped = df.groupby('bin').aggregate({
+                'confidence'+label:'mean',
+                'correct':'mean',
+                'prob_0':'count'
+                })
+            y = grouped['correct']
+            s = grouped["confidence"+label]
+            x = [(b[i] +b[i+1])/2 for i in range(len(b)-1)]
+            d = df['confidence'+label]
+            return d,s,x,y
+        
+        f, axes = plt.subplots(1, 3, figsize=(11*3,7))
+        
+        for lab, ax, title in zip((label1, label2, label3), axes, (title1, title2, title3)):
+            
+            d,s,x,y = get_info(lab)
+            
+            ax.plot([0.5, 1], [0.5, 1], ":", label="Perfectly calibrated", color='gray',linewidth=2.5)
+            ax.plot(s, y, color='red',linewidth=2, label="Model")
+            ax.scatter(s, y, color='red',marker="D",s=15)
+            ax.bar(x, y, width=0.1, color='blue', alpha=0.25)
 
+            (counts, bins) = np.histogram(d, bins=30)
+            ax.hist(bins[:-1], bins, weights=hist_weight*counts, color='black', label="Density")
+
+            ax.set_xlabel("Confidence", fontsize=36)
+            ax.set_ylim([-0.05, 1.05])
+            ax.set_title(title, fontsize=40, pad=15)
+
+            ax.tick_params(axis='both', which='major', labelsize=32)
+            ax.tick_params(axis='both', which='minor', labelsize=32)
+
+
+        axes[1].tick_params(labelleft=False); axes[2].tick_params(labelleft=False)
+        axes[0].set_ylabel('Accuracy', fontsize=36)
+        lines, labels = axes[0].get_legend_handles_labels()
+        f.legend(lines, labels, prop={'size': 36}, loc='upper center', bbox_to_anchor=(0.5, -0.05),
+          fancybox=True, ncol=3)
+
+        if filename:
+            plt.savefig(filename,bbox_inches="tight")
+        
         plt.show()
