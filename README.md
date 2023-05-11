@@ -1,5 +1,5 @@
 # variable-wise-calibration
-Code and examples for "Variable-Based Calibration for Machine Learning Classifiers"
+Code and examples for "Variable-Based Calibration for Machine Learning Classifiers," published at AAAI 2023.
 
 - Code for visualization and recalibration can be found in `Dataset.py` 
 - Data files used are in the `data` folder
